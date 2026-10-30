@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,6 +29,7 @@ type archiveRow struct {
 	title      sql.NullString
 	lastVisit  sql.NullString
 	visitCount int64
+	profile    string
 }
 
 type archivedEntry map[string]json.RawMessage
@@ -84,13 +87,13 @@ func main() {
 	}
 }
 
-func findDatabase(browser, home string) (string, error) {
+func findDatabases(browser, home string) ([]string, error) {
 	config, ok := browsers[browser]
 	if !ok {
-		return "", fmt.Errorf("unsupported browser %q", browser)
+		return nil, fmt.Errorf("unsupported browser %q", browser)
 	}
 	basePath := filepath.Join(home, config.baseDir)
-	var found string
+	var found []string
 	err := filepath.WalkDir(basePath, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if errors.Is(walkErr, fs.ErrNotExist) && path == basePath {
@@ -99,16 +102,15 @@ func findDatabase(browser, home string) (string, error) {
 			return walkErr
 		}
 		if !entry.IsDir() && entry.Name() == config.database {
-			found = path
-			return fs.SkipAll
+			found = append(found, path)
 		}
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("searching for %s history database: %w", browser, err)
+		return nil, fmt.Errorf("searching for %s history databases: %w", browser, err)
 	}
-	if found == "" {
-		return "", fmt.Errorf("could not locate %s history database", browser)
+	if len(found) == 0 {
+		return nil, fmt.Errorf("could not locate %s history database", browser)
 	}
 	return found, nil
 }
@@ -124,11 +126,14 @@ func exportToJSON(browser, home, hostname string) error {
 	}
 	outputPath := filepath.Join(docsDir, fmt.Sprintf("history_%s_%s.json", browser, hostname))
 
-	historyPath, err := findDatabase(browser, home)
+	historyPaths, err := findDatabases(browser, home)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Found database at: %s\n", historyPath)
+	basePath := filepath.Join(home, config.baseDir)
+	for _, path := range historyPaths {
+		fmt.Printf("Found database at: %s\n", path)
+	}
 
 	entries, err := loadEntries(outputPath)
 	if err != nil {
@@ -138,12 +143,27 @@ func exportToJSON(browser, home, hostname string) error {
 		fmt.Printf("Loaded %d existing entries from %s\n", len(entries), outputPath)
 	}
 
-	rows, err := readHistory(historyPath, config.query)
-	if err != nil {
-		return fmt.Errorf("could not read %s history: %w", browser, err)
+	var allRows []archiveRow
+	for _, historyPath := range historyPaths {
+		rows, err := readHistory(historyPath, config.query)
+		if err != nil {
+			return fmt.Errorf("could not read %s history database %s: %w", browser, historyPath, err)
+		}
+		profile, err := filepath.Rel(basePath, filepath.Dir(historyPath))
+		if err != nil {
+			return fmt.Errorf("determining profile for %s history database %s: %w", browser, historyPath, err)
+		}
+		for i := range rows {
+			rows[i].profile = profile
+		}
+		allRows = append(allRows, rows...)
 	}
 
-	merged, added := mergeEntries(entries, rows)
+	firstProfile, err := filepath.Rel(basePath, filepath.Dir(historyPaths[0]))
+	if err != nil {
+		return fmt.Errorf("determining profile for %s history database %s: %w", browser, historyPaths[0], err)
+	}
+	merged, added := mergeEntries(entries, allRows, firstProfile, hostname)
 	if err := saveEntries(outputPath, merged); err != nil {
 		return fmt.Errorf("saving archive to %s: %w", outputPath, err)
 	}
@@ -176,13 +196,30 @@ func loadEntries(path string) ([]archivedEntry, error) {
 		if _, ok := entry["last_visit"]; !ok {
 			return nil, errors.New("existing JSON entry has no last_visit")
 		}
+		if profile, ok := entry["profile"]; ok {
+			var value string
+			if err := json.Unmarshal(profile, &value); err != nil {
+				return nil, errors.New("existing JSON entry has an invalid profile")
+			}
+		}
 		entries = append(entries, entry)
 	}
 	return entries, nil
 }
 
 func readHistory(path, query string) ([]archiveRow, error) {
-	db, err := sql.Open("sqlite", sqliteReadOnlyDSN(path))
+	tempDir, err := os.MkdirTemp("", "hi-history-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tempDir)
+
+	snapshotPath := filepath.Join(tempDir, "history.sqlite")
+	if err := copyDatabaseSnapshot(path, snapshotPath); err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", sqliteFileDSN(snapshotPath))
 	if err != nil {
 		return nil, err
 	}
@@ -208,20 +245,129 @@ func readHistory(path, query string) ([]archiveRow, error) {
 	return result, nil
 }
 
-func sqliteReadOnlyDSN(path string) string {
+type fileState struct {
+	exists  bool
+	size    int64
+	modTime time.Time
+}
+
+func copyDatabaseSnapshot(sourcePath, destinationPath string) error {
+	sourceFiles := []string{sourcePath, sourcePath + "-wal", sourcePath + "-journal"}
+	destinationFiles := []string{destinationPath, destinationPath + "-wal", destinationPath + "-journal"}
+
+	for attempt := 0; attempt < 5; attempt++ {
+		before, err := getFileStates(sourceFiles)
+		if err != nil {
+			return err
+		}
+		if !before[0].exists {
+			return fmt.Errorf("SQLite database %s does not exist", sourcePath)
+		}
+		sidecarDisappeared := false
+		for i, source := range sourceFiles {
+			if before[i].exists {
+				if err := copyFile(source, destinationFiles[i]); err != nil {
+					if i > 0 && errors.Is(err, os.ErrNotExist) {
+						sidecarDisappeared = true
+						break
+					}
+					return fmt.Errorf("copying SQLite file %s: %w", source, err)
+				}
+			} else if err := os.Remove(destinationFiles[i]); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("removing stale SQLite snapshot file %s: %w", destinationFiles[i], err)
+			}
+		}
+		if sidecarDisappeared {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		after, err := getFileStates(sourceFiles)
+		if err != nil {
+			return err
+		}
+		if equalFileStates(before, after) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("SQLite database changed while being copied; retry after browser activity settles")
+}
+
+func getFileStates(paths []string) ([]fileState, error) {
+	states := make([]fileState, len(paths))
+	for i, path := range paths {
+		info, err := os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("checking SQLite file %s: %w", path, err)
+		}
+		states[i] = fileState{exists: true, size: info.Size(), modTime: info.ModTime()}
+	}
+	return states, nil
+}
+
+func equalFileStates(left, right []fileState) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func copyFile(sourcePath, destinationPath string) (resultErr error) {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := source.Close(); resultErr == nil {
+			resultErr = err
+		}
+	}()
+
+	destination, err := os.OpenFile(destinationPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := destination.Close(); resultErr == nil {
+			resultErr = err
+		}
+	}()
+
+	if _, err := io.Copy(destination, source); err != nil {
+		return err
+	}
+	return nil
+}
+
+func sqliteFileDSN(path string) string {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		absolute = path
 	}
 	uri := url.URL{Scheme: "file", Path: filepath.ToSlash(absolute)}
-	return uri.String() + "?mode=ro"
+	return uri.String()
 }
 
-func mergeEntries(existing []archivedEntry, rows []archiveRow) ([]archivedEntry, int) {
+func mergeEntries(existing []archivedEntry, rows []archiveRow, legacyProfile, hostname string) ([]archivedEntry, int) {
 	entries := append([]archivedEntry(nil), existing...)
 	indices := make(map[string]int, len(entries)+len(rows))
 	for i, entry := range entries {
-		indices[string(entry["id"])] = i
+		if _, ok := entry["hostname"]; !ok {
+			entry["hostname"] = mustJSON(hostname)
+		}
+		profile := legacyProfile
+		if rawProfile, ok := entry["profile"]; ok {
+			_ = json.Unmarshal(rawProfile, &profile)
+		}
+		indices[entryKey(profile, string(entry["id"]))] = i
 	}
 
 	added := 0
@@ -236,12 +382,14 @@ func mergeEntries(existing []archivedEntry, rows []archiveRow) ([]archivedEntry,
 		}
 		entry := archivedEntry{
 			"id":          mustJSON(row.id),
+			"hostname":    mustJSON(hostname),
+			"profile":     mustJSON(row.profile),
 			"url":         mustJSON(row.url),
 			"title":       mustJSON(title),
 			"last_visit":  mustJSON(lastVisit),
 			"visit_count": mustJSON(row.visitCount),
 		}
-		key := strconv.FormatInt(row.id, 10)
+		key := entryKey(row.profile, strconv.FormatInt(row.id, 10))
 		if index, exists := indices[key]; exists {
 			entries[index] = entry
 		} else {
@@ -255,6 +403,10 @@ func mergeEntries(existing []archivedEntry, rows []archiveRow) ([]archivedEntry,
 		return lastVisitValue(entries[i]) > lastVisitValue(entries[j])
 	})
 	return entries, added
+}
+
+func entryKey(profile, id string) string {
+	return profile + "\x00" + id
 }
 
 func lastVisitValue(entry archivedEntry) string {

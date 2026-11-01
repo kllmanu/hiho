@@ -31,14 +31,17 @@ type historyEntry struct {
 }
 
 type viewerModel struct {
-	entries      []historyEntry
-	matches      []historyEntry
-	filter       textinput.Model
-	selected     int
-	width        int
-	height       int
-	selectedURL  string
-	hasSelection bool
+	entries        []historyEntry
+	matches        []historyEntry
+	filter         textinput.Model
+	hostnameFilter textinput.Model
+	browserFilter  textinput.Model
+	activeFilter   int
+	selected       int
+	width          int
+	height         int
+	selectedURL    string
+	hasSelection   bool
 }
 
 var (
@@ -73,14 +76,22 @@ func run() error {
 	}
 
 	filter := textinput.New()
-	filter.Prompt = "Filter  "
+	filter.Prompt = "URL  "
 	filter.Placeholder = "type to fuzzy search history"
 	filter.Focus()
+	hostnameFilter := textinput.New()
+	hostnameFilter.Prompt = "Hostname  "
+	hostnameFilter.Placeholder = "all machines"
+	browserFilter := textinput.New()
+	browserFilter.Prompt = "Browser  "
+	browserFilter.Placeholder = "all browsers"
 
 	model := viewerModel{
-		entries: entries,
-		matches: entries,
-		filter:  filter,
+		entries:        entries,
+		matches:        uniqueHistory(entries),
+		filter:         filter,
+		hostnameFilter: hostnameFilter,
+		browserFilter:  browserFilter,
 	}
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := program.Run()
@@ -158,6 +169,10 @@ func loadHistory(documentsDir string) ([]historyEntry, error) {
 	sort.SliceStable(entries, func(i, j int) bool {
 		return entries[i].visitedAt.After(entries[j].visitedAt)
 	})
+	return entries, nil
+}
+
+func uniqueHistory(entries []historyEntry) []historyEntry {
 	unique := make([]historyEntry, 0, len(entries))
 	seenURLs := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
@@ -167,7 +182,7 @@ func loadHistory(documentsDir string) ([]historyEntry, error) {
 		seenURLs[entry.url] = struct{}{}
 		unique = append(unique, entry)
 	}
-	return unique, nil
+	return unique
 }
 
 func archiveBrowser(path string) string {
@@ -187,6 +202,8 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		model.width = message.Width
 		model.height = message.Height
 		model.filter.Width = max(1, message.Width-10)
+		model.hostnameFilter.Width = max(1, message.Width-12)
+		model.browserFilter.Width = max(1, message.Width-11)
 		return model, nil
 
 	case tea.MouseMsg:
@@ -196,9 +213,9 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.MouseButtonWheelDown:
 			model.selected = min(max(0, len(model.matches)-1), model.selected+3)
 		case tea.MouseButtonLeft:
-			listHeight := max(1, model.height-9)
+			listHeight := max(1, model.height-11)
 			start := max(0, model.selected-listHeight+1)
-			row := message.Y - 5
+			row := message.Y - 7
 			index := start + row
 			if message.Action == tea.MouseActionPress &&
 				message.X >= 0 && message.X < model.width &&
@@ -212,9 +229,26 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		switch message.String() {
 		case "ctrl+c":
 			return model, tea.Quit
+		case "tab", "shift+tab":
+			model.filter.Blur()
+			model.hostnameFilter.Blur()
+			model.browserFilter.Blur()
+			step := 1
+			if message.String() == "shift+tab" {
+				step = 2
+			}
+			model.activeFilter = (model.activeFilter + step) % 3
+			return model, model.currentFilter().Focus()
 		case "esc":
-			if model.filter.Value() != "" {
+			if model.currentFilter().Value() != "" {
+				model.currentFilter().SetValue("")
+				model.refreshMatches()
+				return model, nil
+			}
+			if model.filter.Value() != "" || model.hostnameFilter.Value() != "" || model.browserFilter.Value() != "" {
 				model.filter.SetValue("")
+				model.hostnameFilter.SetValue("")
+				model.browserFilter.SetValue("")
 				model.refreshMatches()
 				return model, nil
 			}
@@ -245,17 +279,47 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	oldQuery := model.filter.Value()
+	input := model.currentFilter()
+	oldQuery := input.Value()
 	var command tea.Cmd
-	model.filter, command = model.filter.Update(message)
-	if model.filter.Value() != oldQuery {
+	*input, command = input.Update(message)
+	if input.Value() != oldQuery {
 		model.refreshMatches()
 	}
 	return model, command
 }
 
+func (model *viewerModel) currentFilter() *textinput.Model {
+	switch model.activeFilter {
+	case 1:
+		return &model.hostnameFilter
+	case 2:
+		return &model.browserFilter
+	default:
+		return &model.filter
+	}
+}
+
 func (model *viewerModel) refreshMatches() {
-	model.matches = filterHistory(model.entries, model.filter.Value())
+	hostname := strings.ToLower(strings.TrimSpace(model.hostnameFilter.Value()))
+	browser := strings.ToLower(strings.TrimSpace(model.browserFilter.Value()))
+	candidates := make([]historyEntry, 0, len(model.entries))
+	for _, entry := range model.entries {
+		if strings.Contains(strings.ToLower(entry.hostname), hostname) &&
+			strings.Contains(strings.ToLower(entry.browser), browser) {
+			candidates = append(candidates, entry)
+		}
+	}
+	model.matches = filterHistory(uniqueHistory(candidates), model.filter.Value())
+	if hostname != "" || browser != "" {
+		sort.SliceStable(model.matches, func(i, j int) bool {
+			left, right := model.matches[i], model.matches[j]
+			if left.visitCount != right.visitCount {
+				return left.visitCount > right.visitCount
+			}
+			return left.visitedAt.After(right.visitedAt)
+		})
+	}
 	model.selected = 0
 }
 
@@ -265,11 +329,13 @@ func (model viewerModel) View() string {
 	}
 
 	width := max(1, model.width)
-	listHeight := max(1, model.height-9)
+	listHeight := max(1, model.height-11)
 	lines := make([]string, 0, model.height)
 	lines = append(lines, titleStyle.Render(fitToWidth("Browser history", width)))
 	lines = append(lines, fitToWidth(model.filter.View(), width))
-	lines = append(lines, mutedStyle.Render(fitToWidth("↑/↓ or wheel move  ·  Click select  ·  Enter print URL  ·  Esc clear/quit  ·  Ctrl-C quit", width)))
+	lines = append(lines, fitToWidth(model.hostnameFilter.View(), width))
+	lines = append(lines, fitToWidth(model.browserFilter.View(), width))
+	lines = append(lines, mutedStyle.Render(fitToWidth("Tab/Shift-Tab filter · ↑/↓ or wheel move · Click select · Enter print URL · Esc clear/quit", width)))
 	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width)))
 	dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth := historyColumnWidths(width)
 	header := formatHistoryColumns("Date", "Browser", "Host", "Count", "URL", dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth)
@@ -297,7 +363,7 @@ func (model viewerModel) View() string {
 		}
 		lines = append(lines, line)
 	}
-	for len(lines) < 5+listHeight {
+	for len(lines) < 7+listHeight {
 		lines = append(lines, "")
 	}
 

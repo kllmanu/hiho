@@ -61,6 +61,19 @@ var browsers = map[string]browserConfig{
 		WHERE last_visit_time > 0
 		ORDER BY last_visit_time DESC`,
 	},
+	"brave": {
+		baseDir:  ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+		database: "History",
+		query: `SELECT
+			id,
+			url,
+			title,
+			datetime(last_visit_time / 1000000 - 11644473600, 'unixepoch', 'localtime'),
+			visit_count
+		FROM urls
+		WHERE last_visit_time > 0
+		ORDER BY last_visit_time DESC`,
+	},
 }
 
 func main() {
@@ -76,7 +89,7 @@ func main() {
 	}
 
 	failed := false
-	for _, browser := range []string{"firefox", "chrome"} {
+	for _, browser := range []string{"firefox", "chrome", "brave"} {
 		if err := exportToJSON(browser, home, hostname); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			failed = true

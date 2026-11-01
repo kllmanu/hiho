@@ -8,7 +8,7 @@ build: $(BINARIES)
 hi: hi.go
 	go build -o $@ hi.go
 
-ho: ho.go
+ho: ho.go go.mod go.sum
 	go build -o $@ ho.go
 
 install: build

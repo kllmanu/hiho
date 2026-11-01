@@ -18,9 +18,14 @@ import (
 )
 
 type browserConfig struct {
-	baseDir  string
+	baseDirs []string
 	database string
 	query    string
+}
+
+type historyDatabase struct {
+	path    string
+	profile string
 }
 
 type archiveRow struct {
@@ -36,7 +41,11 @@ type archivedEntry map[string]json.RawMessage
 
 var browsers = map[string]browserConfig{
 	"firefox": {
-		baseDir:  ".config/mozilla/firefox",
+		baseDirs: []string{
+			".config/mozilla/firefox",
+			".mozilla/firefox",
+			".var/app/org.mozilla.firefox/.mozilla/firefox",
+		},
 		database: "places.sqlite",
 		query: `SELECT
 			moz_places.id,
@@ -49,7 +58,10 @@ var browsers = map[string]browserConfig{
 		ORDER BY moz_places.last_visit_date DESC`,
 	},
 	"chrome": {
-		baseDir:  ".config/google-chrome",
+		baseDirs: []string{
+			".config/google-chrome",
+			".var/app/com.google.Chrome/config/google-chrome",
+		},
 		database: "History",
 		query: `SELECT
 			id,
@@ -62,7 +74,10 @@ var browsers = map[string]browserConfig{
 		ORDER BY last_visit_time DESC`,
 	},
 	"brave": {
-		baseDir:  ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+		baseDirs: []string{
+			".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser",
+			".config/BraveSoftware/Brave-Browser",
+		},
 		database: "History",
 		query: `SELECT
 			id,
@@ -100,27 +115,37 @@ func main() {
 	}
 }
 
-func findDatabases(browser, home string) ([]string, error) {
+func findDatabases(browser, home string) ([]historyDatabase, error) {
 	config, ok := browsers[browser]
 	if !ok {
 		return nil, fmt.Errorf("unsupported browser %q", browser)
 	}
-	basePath := filepath.Join(home, config.baseDir)
-	var found []string
-	err := filepath.WalkDir(basePath, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if errors.Is(walkErr, fs.ErrNotExist) && path == basePath {
-				return filepath.SkipDir
+	var found []historyDatabase
+	for rootIndex, baseDir := range config.baseDirs {
+		basePath := filepath.Join(home, baseDir)
+		err := filepath.WalkDir(basePath, func(path string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if errors.Is(walkErr, fs.ErrNotExist) && path == basePath {
+					return filepath.SkipDir
+				}
+				return walkErr
 			}
-			return walkErr
+			if !entry.IsDir() && entry.Name() == config.database {
+				profile, err := filepath.Rel(basePath, filepath.Dir(path))
+				if err != nil {
+					return fmt.Errorf("determining profile for %s: %w", path, err)
+				}
+				// Keep existing profile keys for the original root; namespace new roots.
+				if rootIndex > 0 {
+					profile = filepath.Join(baseDir, profile)
+				}
+				found = append(found, historyDatabase{path: path, profile: profile})
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("searching for %s history databases: %w", browser, err)
 		}
-		if !entry.IsDir() && entry.Name() == config.database {
-			found = append(found, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("searching for %s history databases: %w", browser, err)
 	}
 	if len(found) == 0 {
 		return nil, fmt.Errorf("could not locate %s history database", browser)
@@ -143,9 +168,8 @@ func exportToJSON(browser, home, hostname string) error {
 	if err != nil {
 		return err
 	}
-	basePath := filepath.Join(home, config.baseDir)
-	for _, path := range historyPaths {
-		fmt.Printf("Found database at: %s\n", path)
+	for _, database := range historyPaths {
+		fmt.Printf("Found database at: %s\n", database.path)
 	}
 
 	entries, err := loadEntries(outputPath)
@@ -157,26 +181,18 @@ func exportToJSON(browser, home, hostname string) error {
 	}
 
 	var allRows []archiveRow
-	for _, historyPath := range historyPaths {
-		rows, err := readHistory(historyPath, config.query)
+	for _, database := range historyPaths {
+		rows, err := readHistory(database.path, config.query)
 		if err != nil {
-			return fmt.Errorf("could not read %s history database %s: %w", browser, historyPath, err)
-		}
-		profile, err := filepath.Rel(basePath, filepath.Dir(historyPath))
-		if err != nil {
-			return fmt.Errorf("determining profile for %s history database %s: %w", browser, historyPath, err)
+			return fmt.Errorf("could not read %s history database %s: %w", browser, database.path, err)
 		}
 		for i := range rows {
-			rows[i].profile = profile
+			rows[i].profile = database.profile
 		}
 		allRows = append(allRows, rows...)
 	}
 
-	firstProfile, err := filepath.Rel(basePath, filepath.Dir(historyPaths[0]))
-	if err != nil {
-		return fmt.Errorf("determining profile for %s history database %s: %w", browser, historyPaths[0], err)
-	}
-	merged, added := mergeEntries(entries, allRows, firstProfile, hostname)
+	merged, added := mergeEntries(entries, allRows, historyPaths[0].profile, hostname)
 	if err := saveEntries(outputPath, merged); err != nil {
 		return fmt.Errorf("saving archive to %s: %w", outputPath, err)
 	}

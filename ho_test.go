@@ -51,6 +51,34 @@ func TestMetadataFiltersAndDeduplication(t *testing.T) {
 	}
 }
 
+func TestLiteralURLFilter(t *testing.T) {
+	entries := []historyEntry{
+		{url: "https://example.com/n-i-t-t-e-r", visitCount: 100},
+		{url: "https://nitter.example/older", visitCount: 10, visitedAt: time.Unix(10, 0)},
+		{url: "https://nitter.example/newer", visitCount: 10, visitedAt: time.Unix(20, 0)},
+		{url: "https://nitter.example/popular", visitCount: 20},
+	}
+	matches := filterHistory(entries, "NITTER")
+	if len(matches) != 3 || matches[0].url != entries[3].url || matches[1].url != entries[2].url {
+		t.Fatal("literal URL matches must sort by count then date, excluding scattered letters")
+	}
+	if len(filterHistory(entries[:1], "nitter")) != 0 {
+		t.Fatal("missing literal matches must not trigger a fuzzy fallback")
+	}
+	matches = filterHistory(entries, "nitter newer")
+	if len(matches) != 1 || matches[0].url != entries[2].url {
+		t.Fatal("every space-separated term must occur literally in the URL")
+	}
+	model := testViewer()
+	model.hostnameFilter.SetValue("B570")
+	model.browserFilter.SetValue("brave")
+	model.filter.SetValue("nitter")
+	model.refreshMatches()
+	if len(model.matches) != 0 {
+		t.Fatal("metadata filtering must not trigger fuzzy URL matches")
+	}
+}
+
 func TestFilterFocusAndClearing(t *testing.T) {
 	model := testViewer()
 	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyTab})

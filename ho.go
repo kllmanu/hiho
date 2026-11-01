@@ -16,7 +16,6 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/sahilm/fuzzy"
 )
 
 type historyEntry struct {
@@ -77,7 +76,7 @@ func run() error {
 
 	filter := textinput.New()
 	filter.Prompt = "URL  "
-	filter.Placeholder = "type to fuzzy search history"
+	filter.Placeholder = "search URL text (all terms must match)"
 	filter.Focus()
 	hostnameFilter := textinput.New()
 	hostnameFilter.Prompt = "Hostname  "
@@ -428,70 +427,33 @@ func filterHistory(entries []historyEntry, query string) []historyEntry {
 		return entries
 	}
 
-	urls := make([]string, len(entries))
-	for i, entry := range entries {
-		urls[i] = entry.url
+	for i := range terms {
+		terms[i] = strings.ToLower(terms[i])
 	}
-
-	type rankedMatch struct {
-		index int
-		score int
-	}
-	ranked := make(map[int]int)
-	for termIndex, term := range terms {
-		found := make(map[int]int)
-		for _, match := range fuzzy.Find(term, urls) {
-			found[match.Index] = match.Score
-		}
-
-		literalMatches := make(map[int]bool)
-		normalizedTerm := strings.ToLower(term)
-		for index, url := range urls {
-			if termIndex > 0 {
-				if _, exists := ranked[index]; !exists {
-					continue
-				}
-			}
-			if strings.Contains(strings.ToLower(url), normalizedTerm) {
-				literalMatches[index] = true
+	matches := make([]historyEntry, 0, len(entries))
+	for _, entry := range entries {
+		normalizedURL := strings.ToLower(entry.url)
+		matched := true
+		for _, term := range terms {
+			if !strings.Contains(normalizedURL, term) {
+				matched = false
+				break
 			}
 		}
-
-		nextRanked := make(map[int]int)
-		for index, score := range found {
-			if termIndex > 0 {
-				if previousScore, exists := ranked[index]; exists {
-					score += previousScore
-				} else {
-					continue
-				}
-			}
-			if len(literalMatches) == 0 || literalMatches[index] {
-				nextRanked[index] = score
-			}
+		if matched {
+			matches = append(matches, entry)
 		}
-		ranked = nextRanked
 	}
-
-	results := make([]rankedMatch, 0, len(ranked))
-	for index, score := range ranked {
-		results = append(results, rankedMatch{index: index, score: score})
-	}
-	sort.SliceStable(results, func(i, j int) bool {
-		left, right := entries[results[i].index], entries[results[j].index]
+	sort.SliceStable(matches, func(i, j int) bool {
+		left, right := matches[i], matches[j]
 		if left.visitCount != right.visitCount {
 			return left.visitCount > right.visitCount
 		}
 		if !left.visitedAt.Equal(right.visitedAt) {
 			return left.visitedAt.After(right.visitedAt)
 		}
-		return results[i].index < results[j].index
+		return false
 	})
-
-	matches := make([]historyEntry, len(results))
-	for i, result := range results {
-		matches[i] = entries[result.index]
-	}
 	return matches
 }
 

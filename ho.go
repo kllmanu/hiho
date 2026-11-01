@@ -412,10 +412,10 @@ func filterHistory(entries []historyEntry, query string) []historyEntry {
 		results = append(results, rankedMatch{index: index, score: score})
 	}
 	sort.SliceStable(results, func(i, j int) bool {
-		if results[i].score != results[j].score {
-			return results[i].score > results[j].score
-		}
 		left, right := entries[results[i].index], entries[results[j].index]
+		if left.visitCount != right.visitCount {
+			return left.visitCount > right.visitCount
+		}
 		if !left.visitedAt.Equal(right.visitedAt) {
 			return left.visitedAt.After(right.visitedAt)
 		}

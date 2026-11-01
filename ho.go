@@ -82,7 +82,7 @@ func run() error {
 		matches: entries,
 		filter:  filter,
 	}
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	finalModel, err := program.Run()
 	if err != nil {
 		return fmt.Errorf("running history viewer: %w", err)
@@ -189,6 +189,25 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		model.filter.Width = max(1, message.Width-10)
 		return model, nil
 
+	case tea.MouseMsg:
+		switch message.Button {
+		case tea.MouseButtonWheelUp:
+			model.selected = max(0, model.selected-3)
+		case tea.MouseButtonWheelDown:
+			model.selected = min(max(0, len(model.matches)-1), model.selected+3)
+		case tea.MouseButtonLeft:
+			listHeight := max(1, model.height-9)
+			start := max(0, model.selected-listHeight+1)
+			row := message.Y - 5
+			index := start + row
+			if message.Action == tea.MouseActionPress &&
+				message.X >= 0 && message.X < model.width &&
+				row >= 0 && row < listHeight && index < len(model.matches) {
+				model.selected = index
+			}
+		}
+		return model, nil
+
 	case tea.KeyMsg:
 		switch message.String() {
 		case "ctrl+c":
@@ -250,7 +269,7 @@ func (model viewerModel) View() string {
 	lines := make([]string, 0, model.height)
 	lines = append(lines, titleStyle.Render(fitToWidth("Browser history", width)))
 	lines = append(lines, fitToWidth(model.filter.View(), width))
-	lines = append(lines, mutedStyle.Render(fitToWidth("↑/↓ move  ·  Enter print URL  ·  Esc clear/quit  ·  Ctrl-C quit", width)))
+	lines = append(lines, mutedStyle.Render(fitToWidth("↑/↓ or wheel move  ·  Click select  ·  Enter print URL  ·  Esc clear/quit  ·  Ctrl-C quit", width)))
 	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width)))
 	dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth := historyColumnWidths(width)
 	header := formatHistoryColumns("Date", "Browser", "Host", "Count", "URL", dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth)

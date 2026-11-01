@@ -3,10 +3,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -39,8 +41,14 @@ type viewerModel struct {
 	selected       int
 	width          int
 	height         int
-	selectedURL    string
-	hasSelection   bool
+	marked         map[string]bool
+	opening        bool
+	notice         string
+}
+
+type browserOpenResult struct {
+	opened int
+	err    error
 }
 
 var (
@@ -91,20 +99,36 @@ func run() error {
 		filter:         filter,
 		hostnameFilter: hostnameFilter,
 		browserFilter:  browserFilter,
+		marked:         make(map[string]bool),
 	}
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	finalModel, err := program.Run()
+	_, err = program.Run()
 	if err != nil {
 		return fmt.Errorf("running history viewer: %w", err)
 	}
-	final, ok := finalModel.(viewerModel)
-	if !ok {
-		return errors.New("history viewer returned an unexpected model")
-	}
-	if final.hasSelection {
-		fmt.Println(final.selectedURL)
-	}
 	return nil
+}
+
+func openHistoryURLs(urls []string) tea.Cmd {
+	return func() tea.Msg {
+		result := browserOpenResult{}
+		for _, rawURL := range urls {
+			lowerURL := strings.ToLower(rawURL)
+			if !strings.HasPrefix(lowerURL, "https://") && !strings.HasPrefix(lowerURL, "http://") {
+				result.err = errors.Join(result.err, fmt.Errorf("cannot open non-web URL %q", rawURL))
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			output, err := exec.CommandContext(ctx, "xdg-open", rawURL).CombinedOutput()
+			cancel()
+			if err != nil {
+				result.err = errors.Join(result.err, fmt.Errorf("opening %q: %w (%s)", rawURL, err, strings.TrimSpace(string(output))))
+				continue
+			}
+			result.opened++
+		}
+		return result
+	}
 }
 
 func loadHistory(documentsDir string) ([]historyEntry, error) {
@@ -197,6 +221,13 @@ func (model viewerModel) Init() tea.Cmd {
 
 func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
+	case browserOpenResult:
+		model.opening = false
+		model.notice = fmt.Sprintf("Opened %d URL(s)", message.opened)
+		if message.err != nil {
+			model.notice += " · Error: " + cleanDisplay(message.err.Error())
+		}
+		return model, nil
 	case tea.WindowSizeMsg:
 		model.width = message.Width
 		model.height = message.Height
@@ -220,6 +251,9 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				message.X >= 0 && message.X < model.width &&
 				row >= 0 && row < listHeight && index < len(model.matches) {
 				model.selected = index
+				if message.Ctrl {
+					model.toggleMarked()
+				}
 			}
 		}
 		return model, nil
@@ -253,12 +287,34 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return model, tea.Quit
 		case "enter":
-			if len(model.matches) > 0 {
-				model.selectedURL = model.matches[model.selected].url
-				model.hasSelection = true
-				return model, tea.Quit
+			if model.opening {
+				return model, nil
 			}
+			var urls []string
+			for _, entry := range uniqueHistory(model.entries) {
+				if model.marked[entry.url] {
+					urls = append(urls, entry.url)
+				}
+			}
+			if len(urls) == 0 && len(model.matches) > 0 {
+				urls = append(urls, model.matches[model.selected].url)
+			}
+			if len(urls) == 0 {
+				return model, nil
+			}
+			model.opening = true
+			model.notice = fmt.Sprintf("Opening %d URL(s)…", len(urls))
+			return model, openHistoryURLs(urls)
+		case " ":
+			model.toggleMarked()
 			return model, nil
+		case "alt+ ":
+			message.Alt = false
+			input := model.currentFilter()
+			var command tea.Cmd
+			*input, command = input.Update(message)
+			model.refreshMatches()
+			return model, command
 		case "up", "ctrl+p":
 			if model.selected > 0 {
 				model.selected--
@@ -286,6 +342,21 @@ func (model viewerModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		model.refreshMatches()
 	}
 	return model, command
+}
+
+func (model *viewerModel) toggleMarked() {
+	if len(model.matches) == 0 {
+		return
+	}
+	if model.marked == nil {
+		model.marked = make(map[string]bool)
+	}
+	rawURL := model.matches[model.selected].url
+	if model.marked[rawURL] {
+		delete(model.marked, rawURL)
+	} else {
+		model.marked[rawURL] = true
+	}
 }
 
 func (model *viewerModel) currentFilter() *textinput.Model {
@@ -334,11 +405,11 @@ func (model viewerModel) View() string {
 	lines = append(lines, fitToWidth(model.filter.View(), width))
 	lines = append(lines, fitToWidth(model.hostnameFilter.View(), width))
 	lines = append(lines, fitToWidth(model.browserFilter.View(), width))
-	lines = append(lines, mutedStyle.Render(fitToWidth("Tab/Shift-Tab filter · ↑/↓ or wheel move · Click select · Enter print URL · Esc clear/quit", width)))
+	lines = append(lines, mutedStyle.Render(fitToWidth("Space/Ctrl-click mark · Enter open · Tab filter · Alt-Space insert space · ↑/↓ or wheel move · Esc clear/quit", width)))
 	lines = append(lines, mutedStyle.Render(strings.Repeat("─", width)))
-	dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth := historyColumnWidths(width)
+	dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth := historyColumnWidths(max(0, width-2))
 	header := formatHistoryColumns("Date", "Browser", "Host", "Count", "URL", dateWidth, browserWidth, hostnameWidth, countWidth, urlWidth, gapWidth)
-	lines = append(lines, mutedStyle.Render(header))
+	lines = append(lines, mutedStyle.Render(fitToWidth("  "+header, width)))
 
 	start := max(0, model.selected-listHeight+1)
 	end := min(len(model.matches), start+listHeight)
@@ -357,6 +428,11 @@ func (model viewerModel) View() string {
 			urlWidth,
 			gapWidth,
 		)
+		marker := "  "
+		if model.marked[entry.url] {
+			marker = "* "
+		}
+		line = fitToWidth(marker+line, width)
 		if index == model.selected {
 			line = selectedStyle.Render(line)
 		}
@@ -376,8 +452,12 @@ func (model viewerModel) View() string {
 	}
 
 	status := fmt.Sprintf("%d matching entries", len(model.matches))
+	status += fmt.Sprintf(" · %d marked", len(model.marked))
 	if len(model.matches) > 0 {
 		status += fmt.Sprintf("  ·  %d of %d", model.selected+1, len(model.matches))
+	}
+	if model.notice != "" {
+		status = model.notice + " · " + status
 	}
 	lines = append(lines, mutedStyle.Render(fitToWidth(status, width)))
 
